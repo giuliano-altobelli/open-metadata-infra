@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+exec > >(tee -a /var/log/openmetadata-bootstrap.log | logger -t openmetadata-bootstrap -s 2>/dev/console) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+DATA_VOLUME_ID="${data_volume_id}"
+MOUNT_POINT="/opt/openmetadata"
+
+find_data_device() {
+  local compact_volume_id
+  compact_volume_id="$${DATA_VOLUME_ID//-/}"
+
+  lsblk -ndo PATH,SERIAL | awk -v target="$${compact_volume_id}" '$2 == target { print $1; exit }'
+}
+
+echo "Waiting for EBS data volume $${DATA_VOLUME_ID}"
+data_device=""
+for _ in $(seq 1 120); do
+  data_device="$(find_data_device)"
+  if [[ -n "$${data_device}" && -b "$${data_device}" ]]; then
+    break
+  fi
+  sleep 5
+done
+
+if [[ -z "$${data_device}" || ! -b "$${data_device}" ]]; then
+  echo "EBS data volume $${DATA_VOLUME_ID} was not attached within 10 minutes" >&2
+  exit 1
+fi
+
+if ! blkid "$${data_device}" >/dev/null 2>&1; then
+  mkfs.ext4 -F "$${data_device}"
+fi
+
+data_uuid="$(blkid -s UUID -o value "$${data_device}")"
+mkdir -p "$${MOUNT_POINT}"
+if ! grep -q "UUID=$${data_uuid}" /etc/fstab; then
+  echo "UUID=$${data_uuid} $${MOUNT_POINT} ext4 defaults,nofail 0 2" >> /etc/fstab
+fi
+mount "$${MOUNT_POINT}" || mount -a
+
+apt-get update
+apt-get install -y ca-certificates curl docker.io docker-compose-v2 openssl
+
+systemctl stop docker.service docker.socket || true
+metadata_token="$(curl --fail --silent --show-error --request PUT \
+  --header 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+  http://169.254.169.254/latest/api/token)"
+runtime_instance_id="$(curl --fail --silent --show-error \
+  --header "X-aws-ec2-metadata-token: $${metadata_token}" \
+  http://169.254.169.254/latest/meta-data/instance-id)"
+docker_runtime_dir="$${MOUNT_POINT}/docker-runtime/$${runtime_instance_id}"
+mkdir -p "$${docker_runtime_dir}" /etc/docker
+if [[ -s /etc/docker/daemon.json ]]; then
+  cp /etc/docker/daemon.json /etc/docker/daemon.json.before-openmetadata
+fi
+cat > /etc/docker/daemon.json <<DOCKER_CONFIG
+{
+  "data-root": "$${docker_runtime_dir}",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "20m",
+    "max-file": "3"
+  }
+}
+DOCKER_CONFIG
+
+cat > /etc/sysctl.d/99-openmetadata.conf <<'SYSCTL'
+vm.max_map_count=262144
+SYSCTL
+sysctl --system
+
+systemctl enable --now docker
+usermod -aG docker ubuntu
+
+app_dir="$${MOUNT_POINT}/app"
+install -d -m 0750 "$${app_dir}" "$${app_dir}/docker-volume/db-data-postgres" "$${app_dir}/docker-volume/es-data"
+install -d -o 1000 -g 1000 -m 0750 "$${app_dir}/jwtkeys"
+chown -R 1000:1000 "$${app_dir}/docker-volume/es-data"
+
+cat > "$${app_dir}/compose.yml" <<'COMPOSE_YAML'
+${compose_yaml}
+COMPOSE_YAML
+
+cat > "$${app_dir}/init-db.sh" <<'INIT_DB'
+#!/bin/sh
+set -eu
+
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --set=om_password="$OPENMETADATA_DB_PASSWORD" <<'SQL'
+CREATE USER openmetadata_user WITH PASSWORD :'om_password';
+CREATE DATABASE openmetadata_db OWNER openmetadata_user;
+SQL
+
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname openmetadata_db <<'SQL'
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+GRANT USAGE, CREATE ON SCHEMA public TO openmetadata_user;
+SQL
+INIT_DB
+chmod 0555 "$${app_dir}/init-db.sh"
+
+umask 077
+if [[ ! -f "$${app_dir}/.env" ]]; then
+  cat > "$${app_dir}/.env" <<ENVIRONMENT
+POSTGRES_SUPERUSER_PASSWORD=$(openssl rand -hex 32)
+OPENMETADATA_DB_PASSWORD=$(openssl rand -hex 32)
+FERNET_KEY=$(openssl rand -base64 32)
+JWT_KEY_ID=$(openssl rand -hex 16)
+ENVIRONMENT
+fi
+
+if [[ ! -f "$${app_dir}/jwtkeys/private_key.der" ]]; then
+  temporary_pem="$(mktemp)"
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$${temporary_pem}"
+  openssl pkcs8 -topk8 -inform PEM -outform DER -in "$${temporary_pem}" -out "$${app_dir}/jwtkeys/private_key.der" -nocrypt
+  openssl pkey -in "$${temporary_pem}" -pubout -outform DER -out "$${app_dir}/jwtkeys/public_key.der"
+  rm -f "$${temporary_pem}"
+  chown 1000:1000 "$${app_dir}/jwtkeys/private_key.der" "$${app_dir}/jwtkeys/public_key.der"
+  chmod 0400 "$${app_dir}/jwtkeys/private_key.der"
+  chmod 0444 "$${app_dir}/jwtkeys/public_key.der"
+fi
+
+cat > /etc/systemd/system/openmetadata.service <<'SYSTEMD'
+[Unit]
+Description=OpenMetadata Docker Compose proof of concept
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/openmetadata/app
+ExecStart=/usr/bin/docker compose up --detach --remove-orphans
+ExecStop=/usr/bin/docker compose stop
+TimeoutStartSec=0
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target
+SYSTEMD
+
+cd "$${app_dir}"
+docker compose config --quiet
+systemctl daemon-reload
+systemctl enable --now openmetadata.service
+
+echo "OpenMetadata bootstrap completed"

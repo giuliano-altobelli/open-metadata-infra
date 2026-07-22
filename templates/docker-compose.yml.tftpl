@@ -1,0 +1,146 @@
+name: openmetadata
+
+x-openmetadata-environment: &openmetadata-environment
+  OPENMETADATA_CLUSTER_NAME: openmetadata
+  LOG_LEVEL: INFO
+  OPENMETADATA_HEAP_OPTS: "-Xms2G -Xmx2G"
+
+  DB_DRIVER_CLASS: org.postgresql.Driver
+  DB_SCHEME: postgresql
+  DB_PARAMS: sslmode=disable
+  DB_USER: openmetadata_user
+  DB_USER_PASSWORD: "$${OPENMETADATA_DB_PASSWORD}"
+  DB_HOST: postgresql
+  DB_PORT: "5432"
+  OM_DATABASE: openmetadata_db
+  DB_CONNECTION_POOL_MAX_SIZE: "20"
+  DB_CONNECTION_POOL_MIN_SIZE: "5"
+  DB_CONNECTION_POOL_MIN_IDLE: "5"
+  DB_CONNECTION_POOL_INITIAL_SIZE: "5"
+
+  SEARCH_TYPE: elasticsearch
+  ELASTICSEARCH_HOST: elasticsearch
+  ELASTICSEARCH_PORT: "9200"
+  ELASTICSEARCH_SCHEME: http
+
+  AUTHENTICATION_PROVIDER: basic
+  AUTHENTICATION_PUBLIC_KEYS: "[${external_url}/api/v1/system/config/jwks]"
+  AUTHENTICATION_AUTHORITY: "${external_url}"
+  AUTHENTICATION_ENABLE_SELF_SIGNUP: "false"
+  AUTHORIZER_ADMIN_PRINCIPALS: "[admin]"
+  AUTHORIZER_PRINCIPAL_DOMAIN: open-metadata.org
+  AUTHORIZER_ALLOWED_REGISTRATION_DOMAIN: '["open-metadata.org"]'
+  AUTHORIZER_ENFORCE_PRINCIPAL_DOMAIN: "true"
+
+  RSA_PUBLIC_KEY_FILE_PATH: /etc/openmetadata/jwtkeys/public_key.der
+  RSA_PRIVATE_KEY_FILE_PATH: /etc/openmetadata/jwtkeys/private_key.der
+  JWT_ISSUER: open-metadata.org
+  JWT_KEY_ID: "$${JWT_KEY_ID}"
+  FERNET_KEY: "$${FERNET_KEY}"
+
+  PIPELINE_SERVICE_CLIENT_ENABLED: "false"
+  SERVER_HOST_API_URL: http://openmetadata-server:8585/api
+  SERVER_USE_FORWARDED_HEADERS: "true"
+  MASK_PASSWORDS_API: "true"
+  WEB_CONF_FRAME_OPTION_ENABLED: "true"
+  WEB_CONF_FRAME_OPTION: SAMEORIGIN
+  WEB_CONF_CONTENT_TYPE_OPTIONS_ENABLED: "true"
+  WEB_CONF_REFERRER_POLICY_ENABLED: "true"
+  WEB_CONF_REFERRER_POLICY_OPTION: SAME_ORIGIN
+
+services:
+  postgresql:
+    image: postgres:15-alpine
+    container_name: openmetadata_postgresql
+    restart: unless-stopped
+    command: ["postgres", "-c", "work_mem=10MB"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "$${POSTGRES_SUPERUSER_PASSWORD}"
+      OPENMETADATA_DB_PASSWORD: "$${OPENMETADATA_DB_PASSWORD}"
+    expose:
+      - "5432"
+    volumes:
+      - ./docker-volume/db-data-postgres:/var/lib/postgresql/data
+      - ./init-db.sh:/docker-entrypoint-initdb.d/10-openmetadata.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d openmetadata_db"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+    networks:
+      - app_net
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.3.0
+    container_name: openmetadata_elasticsearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      ES_JAVA_OPTS: "-Xms1G -Xmx1G"
+      xpack.security.enabled: "false"
+    expose:
+      - "9200"
+      - "9300"
+    volumes:
+      - ./docker-volume/es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 45s
+    networks:
+      - app_net
+
+  execute-migrate-all:
+    image: docker.getcollate.io/openmetadata/server:${openmetadata_version}
+    container_name: openmetadata_migrate
+    restart: "no"
+    command: ./bootstrap/openmetadata-ops.sh migrate
+    environment: *openmetadata-environment
+    volumes:
+      - ./jwtkeys:/etc/openmetadata/jwtkeys:ro
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - app_net
+
+  openmetadata-server:
+    image: docker.getcollate.io/openmetadata/server:${openmetadata_version}
+    container_name: openmetadata_server
+    restart: unless-stopped
+    environment: *openmetadata-environment
+    volumes:
+      - ./jwtkeys:/etc/openmetadata/jwtkeys:ro
+    ports:
+      - "8585:8585"
+    expose:
+      - "8586"
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      execute-migrate-all:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8586/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - app_net
+
+networks:
+  app_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.16.240.0/24
+

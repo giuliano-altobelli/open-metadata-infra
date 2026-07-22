@@ -1,0 +1,11 @@
+aws_region = "us-west-2"
+
+# Replace with your current public IPv4 address. For example, if
+# `curl -4 https://checkip.amazonaws.com` prints 198.51.100.10:
+allowed_cidrs = ["198.51.100.10/32"]
+
+# Optional but recommended. AWS will send a subscription confirmation.
+# budget_alert_email = "you@example.com"
+
+monthly_budget_usd = 300
+
